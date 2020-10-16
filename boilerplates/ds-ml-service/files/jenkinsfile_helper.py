@@ -2,7 +2,6 @@ import argparse
 import time
 
 import requests
-from requests import RequestException
 from requests.auth import HTTPBasicAuth
 
 
@@ -29,30 +28,21 @@ def start_training(host_url, http_auth):
         indicates the success of the result of the training process
 
     """
-    response = None
-    count = 0
+
     print("Training server is on: {0}".format(host_url))
+    response = requests.get(
+        '{0}/start'.format(host_url), auth=http_auth, stream=True)
 
-    while count < 30:
-        # noinspection PyBroadException
-        try:
-            response = requests.get(
-                '{0}/start'.format(host_url), auth=http_auth, stream=True)
-            success = True
-            return success
-        except (ConnectionRefusedError, ConnectionError, OSError, RequestException):
-            count += 1
-            time.sleep(5)
-            continue
-
-    if not response or response.status_code != 202:
+    if response.status_code != 202:
         print("Training service not reachable!")
         success = False
-        return success
+    else:
+        success = True
+    return success
 
 
-def wait_for_training():
-    """check every 5 seconds if the training has finished using the *finished* endpoint fromt he
+def wait_for_training(host_url, http_auth):
+    """check every 5 seconds if the training has finished using the *finished* endpoint from the
     training service
 
     Returns
@@ -66,9 +56,11 @@ def wait_for_training():
         try:
             print("Waiting for the training to finished...")
             response = requests.get(
-                '{0}/finished'.format(host), auth=auth, stream=True)
+                '{0}/finished'.format(host_url), auth=http_auth, stream=True)
             res_json = response.json()
             if res_json['finished']:
+                if response.status_code == 500:
+                    raise Exception(res_json)
                 finished = True
                 print("Training finished")
                 return finished
@@ -94,4 +86,4 @@ if __name__ == '__main__':
     training_started = start_training(host, auth)
 
     if training_started:
-        training_finished = wait_for_training()
+        training_finished = wait_for_training(host, auth)

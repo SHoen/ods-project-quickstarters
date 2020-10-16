@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+set -e
+# Not using -x (tracing) to avoid disclosure of passwords/tokens when
+# processing unknown arguments.
+
 # This script creates the 3 OCP projects we currently require for every
 # OD project.
 # * project-cd  : containing jenkins
@@ -20,28 +24,27 @@ case $key in
     PROJECT="$2"
     shift # past argument
     ;;
-    -u|--cd_user)
-    CD_USER="$2"
-    shift # past argument
-    ;;
-    -w|--cd_pwd)
-    CD_USER_PWD="$2"
-    shift # past argument
-    ;;
 	-a|--project_admins)
     OD_PRJ_ADMINS="$2"
     shift # past argument
-    ;;    
+    ;;
+	-e|--project_entitlements)
+    OD_PRJ_ENTL_GROUPS="$2"
+    shift # past argument
+    ;;
     -n|--nexus)
     NEXUS_HOST="$2"
     shift # past argument
     ;;
     *)
-            # unknown option
+        echo "Unknown option: $1. Exiting."
+        exit 1
     ;;
 esac
 shift # past argument or value
 done
+
+set -x  # no passwords/tokens are used below
 
 # check required parameters
 if [ -z ${PROJECT+x} ]; then
@@ -58,42 +61,35 @@ oc new-project ${PROJECT}-cd
 oc new-project ${PROJECT}-dev
 oc new-project ${PROJECT}-test
 
-# set admin permissions for Jenkins on the project(s)
-## remark: 'edit' role may be sufficient but in case the pipeline needs to do more advanced tasks, 'admin' may be required
+# set admin permissions for the Jenkins SA on the project(s)
+# this is needed to clone an entire project including role bindings for autocloneEnv in the shared lib
 
 JENKINS_ROLE=admin
 
+# allow jenkins from CD project to admin the environment projects
 oc policy add-role-to-user ${JENKINS_ROLE} system:serviceaccount:${PROJECT}-cd:jenkins -n ${PROJECT}-dev
 oc policy add-role-to-user ${JENKINS_ROLE} system:serviceaccount:${PROJECT}-cd:jenkins -n ${PROJECT}-test
 
-# allow default project user to modify build configs in dev and test
-oc policy add-role-to-user edit system:serviceaccount:${PROJECT}-cd:default -n ${PROJECT}-dev
-# cut - default (cd) user needs admin rights to pull secrets during project clone
-oc policy add-role-to-user admin system:serviceaccount:${PROJECT}-cd:default -n ${PROJECT}-test
-oc policy add-role-to-user edit system:serviceaccount:${PROJECT}-cd:default -n ${PROJECT}-cd
-
 # allow jenkins in <project>-cd to pull images (e.g. slave) from cd project
 oc policy add-role-to-user system:image-puller system:serviceaccount:${PROJECT}-cd:jenkins -n cd
-oc policy add-role-to-user system:image-puller system:serviceaccount:${PROJECT}:default -n cd
 
-# not really needed, because we build an image directly on master again, no pulling
+# allow webhook proxy to create a pipeline BC in the +cd project
+oc policy add-role-to-user edit -z default -n ${PROJECT}-cd
+
+# seed jenkins SA with edit roles in CD project / to even run jenkins
+oc policy add-role-to-user edit -z jenkins -n ${PROJECT}-cd
+
+# allow test users to pull dev images
 oc policy add-role-to-group system:image-puller system:serviceaccounts:${PROJECT}-test -n $PROJECT-dev
 
-# allow all authenticated users to access and view the project
-oc policy add-role-to-group view system:authenticated -n $PROJECT-dev
-oc policy add-role-to-group view system:authenticated -n $PROJECT-test
-oc policy add-role-to-group view system:authenticated -n $PROJECT-cd
-oc policy add-role-to-group edit system:authenticated -n $PROJECT-dev
-oc policy add-role-to-group edit system:authenticated -n $PROJECT-test
-oc policy add-role-to-group edit system:authenticated -n $PROJECT-cd
-oc policy add-role-to-group basic-user system:authenticated -n $PROJECT-dev
-oc policy add-role-to-group basic-user system:authenticated -n $PROJECT-test
-oc policy add-role-to-group basic-user system:authenticated -n $PROJECT-cd
+# image-builder for sa default needed to import images from other cluster
+oc policy add-role-to-user system:image-builder -z default -n ${PROJECT}-dev
+oc policy add-role-to-user system:image-builder -z default -n ${PROJECT}-test
 
 # seed admins, by default only role dedicated-admin has admin rights
-if [[ ! -z ${OD_PRJ_ADMINS} ]]; then 
+if [[ ! -z ${OD_PRJ_ADMINS} ]]; then
 	for admin_user in $(echo $OD_PRJ_ADMINS | sed -e 's/,/ /g');
-	do		
+	do
 		echo "- seeding admin: ${admin_user}"
 		oc policy add-role-to-user admin ${admin_user} -n ${PROJECT}-dev
 		oc policy add-role-to-user admin ${admin_user} -n ${PROJECT}-test
@@ -101,10 +97,52 @@ if [[ ! -z ${OD_PRJ_ADMINS} ]]; then
 	done
 fi
 
-# create jenkins in the cd project
-oc process cd//cd-jenkins-master | oc create -f- -n ${PROJECT}-cd
-oc process cd//cd-jenkins-webhook-proxy | oc create -f- -n ${PROJECT}-cd
+if [[ ! -z ${OD_PRJ_ENTL_GROUPS} ]]; then
+	echo "seeding special permission groups"
+	for group in $(echo $OD_PRJ_ENTL_GROUPS | sed -e 's/,/ /g');
+	do
+		groupName=$(echo $group | cut -d "=" -f1)
+		groupValue=$(echo $group | cut -d "=" -f2)
 
-# add secrets for dockerfile build to dev and tes
-oc process cd//secrets PROJECT=${PROJECT} | oc create -f- -n ${PROJECT}-dev
-oc process cd//secrets PROJECT=${PROJECT} | oc create -f- -n ${PROJECT}-test
+		usergroup_role=edit
+		admingroup_role=admin
+		readonlygroup_role=view
+
+		if [[ ${groupValue} == "" ]];
+		then
+			continue
+		fi
+
+		echo "- seeding groups: ${groupName^^} - ${groupValue}"
+		if [[ ${groupName^^} == *USERGROUP* ]]; then
+			oc policy add-role-to-group ${usergroup_role} ${groupValue} -n ${PROJECT}-dev
+			oc policy add-role-to-group ${usergroup_role} ${groupValue} -n ${PROJECT}-test
+			oc policy add-role-to-group ${usergroup_role} ${groupValue} -n ${PROJECT}-cd
+		elif [[ ${groupName^^} == *ADMINGROUP* ]]; then
+			oc policy add-role-to-group ${admingroup_role} ${groupValue} -n ${PROJECT}-dev
+			oc policy add-role-to-group ${admingroup_role} ${groupValue} -n ${PROJECT}-test
+			oc policy add-role-to-group ${admingroup_role} ${groupValue} -n ${PROJECT}-cd
+		elif [[ ${groupName^^} == *READONLYGROUP* ]]; then
+			oc policy add-role-to-group ${readonlygroup_role} ${groupValue} -n ${PROJECT}-dev
+			oc policy add-role-to-group ${readonlygroup_role} ${groupValue} -n ${PROJECT}-test
+			oc policy add-role-to-group ${readonlygroup_role} ${groupValue} -n ${PROJECT}-cd
+		fi
+	done
+else
+	echo "- seeding default edit/view rights for system:authenticated"
+	oc policy add-role-to-group edit system:authenticated -n $PROJECT-dev
+	oc policy add-role-to-group edit system:authenticated -n $PROJECT-test
+	oc policy add-role-to-group edit system:authenticated -n $PROJECT-cd
+
+	# allow all authenticated users to view the project
+	oc policy add-role-to-group view system:authenticated -n $PROJECT-dev
+	oc policy add-role-to-group view system:authenticated -n $PROJECT-test
+	oc policy add-role-to-group view system:authenticated -n $PROJECT-cd
+fi
+
+# http://stackoverflow.com/a/12694189
+DIR=$(cd "${BASH_SOURCE%/*}" && pwd)
+if [[ ! -d "$DIR" ]]; then DIR="$PWD"; fi
+
+# create jenkins and secrets in the cd project
+"$DIR/create-cd-jenkins.sh" -p $PROJECT
